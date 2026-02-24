@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Behavioral Residue – Aura Presence</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg-start: #050712;
+      --bg-end: #050b18;
+      --grain-opacity: 0.12;
+      --text-soft: #d1d5db;
+      --text-faint: #6b7280;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: radial-gradient(circle at top, var(--bg-start), var(--bg-end) 65%);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+        "Inter", "Segoe UI", sans-serif;
+    }
+
+    body {
+      position: relative;
+      color: var(--text-soft);
+    }
+
+    .grain {
+      pointer-events: none;
+      position: fixed;
+      inset: 0;
+      opacity: var(--grain-opacity);
+      background-image:
+        radial-gradient(circle at 0 0, rgba(255,255,255,0.05) 0, transparent 50%),
+        radial-gradient(circle at 100% 100%, rgba(255,255,255,0.05) 0, transparent 50%),
+        radial-gradient(circle at 100% 0, rgba(255,255,255,0.04) 0, transparent 55%),
+        radial-gradient(circle at 0 100%, rgba(255,255,255,0.04) 0, transparent 55%);
+      mix-blend-mode: soft-light;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      pointer-events: none;
+    }
+
+    #bgCanvas {
+      z-index: 1;
+    }
+
+    #fogCanvas {
+      z-index: 2;
+    }
+
+    .ui-layer {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      z-index: 3;
+      color: var(--text-soft);
+      text-align: center;
+    }
+
+    .prompt {
+      font-size: clamp(1.1rem, 1.6vw, 1.6rem);
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      opacity: 0.35;
+      mix-blend-mode: screen;
+    }
+
+    .status {
+      position: absolute;
+      bottom: 2.5rem;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.8rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      opacity: 0.0; /* animated in via JS */
+      color: var(--text-faint);
+    }
+
+    .status span {
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="bgCanvas"></canvas>
+  <canvas id="fogCanvas"></canvas>
+  <div class="grain"></div>
+
+  <div class="ui-layer">
+    <div class="prompt">are you here</div>
+    <div class="status" id="statusText">
+      <span>last seen: now</span>
+    </div>
+  </div>
+
+  <script>
+    // ====== Utility: Canvas setup with devicePixelRatio ======
+    const dpr = window.devicePixelRatio || 1;
+    const bgCanvas = document.getElementById('bgCanvas');
+    const fogCanvas = document.getElementById('fogCanvas');
+    const bgCtx = bgCanvas.getContext('2d');
+    const fogCtx = fogCanvas.getContext('2d');
+
+    // Fog timing/tuning (mirror-like: stays clear, slowly returns)
+    const FOG_REBUILD_START_IDLE_S = 30; // no re-fogging before this idle time
+    const FOG_REBUILD_RAMP_S = 30;       // how long it takes to reach "full" rebuild speed
+    const FOG_REBUILD_ALPHA_MIN = 0.0006; // per frame @ ~60fps (still smooth)
+    const FOG_REBUILD_ALPHA_MAX = 0.0045; // per frame @ ~60fps (reaches full fog in ~20–30s)
+    const FOG_CLEAR_ACTIVE_ALPHA = 0.012;  // per frame @ ~60fps (slowly dissipates while active)
+    const FOG_CLEAR_PULSE_ALPHA = 0.22;    // click/keypress clears a lot instantly
+
+    function resizeCanvas() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      [bgCanvas, fogCanvas].forEach((c, i) => {
+        c.width = w * dpr;
+        c.height = h * dpr;
+        const ctx = i === 0 ? bgCtx : fogCtx;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      });
+
+      recomputeProfileGeometry();
+      clearAll();
+    }
+
+    window.addEventListener('resize', resizeCanvas);
+
+    // ====== Profile circle / layout ======
+    const profile = {
+      cx: 0,
+      cy: 0,
+      radius: 0
+    };
+
+    function recomputeProfileGeometry() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      profile.cx = w / 2;
+      profile.cy = h / 2;
+      profile.radius = Math.min(w, h) * 0.24;
+    }
+
+    function isInsideProfile(x, y) {
+      const dx = x - profile.cx;
+      const dy = y - profile.cy;
+      return dx * dx + dy * dy <= profile.radius * profile.radius;
+    }
+
+    function clearAll() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      bgCtx.clearRect(0, 0, w, h);
+      fogCtx.clearRect(0, 0, w, h);
+    }
+
+    // ====== Behavior tracking ======
+    let lastX = null;
+    let lastY = null;
+    let lastMoveTime = performance.now();
+    let lastInteractionTime = performance.now();
+    let lastVectorAngle = null;
+    let pendingTrail = null;
+    const wipeEvents = [];
+    let lastWipeEnqueueTime = 0;
+
+    let emaSpeed = 0;   // px/ms
+    let emaJitter = 0;  // radians
+    let emaAccel = 0;   // not directly mapped but tracked for richness
+    let lastSpeed = 0;
+
+    const clickTimestamps = []; // ms
+
+    function registerClick() {
+      const now = performance.now();
+      clickTimestamps.push(now);
+      lastInteractionTime = now;
+      clearFogPulse();
+    }
+
+    window.addEventListener('click', registerClick);
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'c' || e.key === 'C' || e.key === ' ') clearFogPulse();
+    });
+
+    function handleMouseMove(e) {
+      const now = performance.now();
+      const x = e.clientX;
+      const y = e.clientY;
+      const prevX = lastX;
+      const prevY = lastY;
+
+      if (prevX !== null && prevY !== null) {
+        const dx = x - prevX;
+        const dy = y - prevY;
+        const dt = Math.max(now - lastMoveTime, 1); // ms
+
+        const dist = Math.hypot(dx, dy);
+        const instSpeed = dist / dt; // px per ms
+
+        // Jitter: angle change between vectors
+        const angle = Math.atan2(dy, dx);
+        let instJitter = 0;
+        if (lastVectorAngle !== null) {
+          let delta = angle - lastVectorAngle;
+          // Wrap to [-PI, PI]
+          while (delta > Math.PI) delta -= 2 * Math.PI;
+          while (delta < -Math.PI) delta += 2 * Math.PI;
+          instJitter = Math.abs(delta);
+        }
+
+        // Exponential moving averages (simple, time-insensitive)
+        const smooth = 0.15;
+        emaSpeed = emaSpeed + smooth * (instSpeed - emaSpeed);
+        emaJitter = emaJitter + smooth * (instJitter - emaJitter);
+
+        const instAccel = (instSpeed - lastSpeed) / dt;
+        emaAccel = emaAccel + smooth * (Math.abs(instAccel) - emaAccel);
+        lastSpeed = instSpeed;
+        lastVectorAngle = angle;
+      }
+
+      lastX = x;
+      lastY = y;
+      lastMoveTime = now;
+      lastInteractionTime = now;
+      if (prevX !== null && prevY !== null) {
+        pendingTrail = { x0: prevX, y0: prevY, x1: x, y1: y };
+      }
+
+      // Queue wipe events so the fog can respond with delay/glow/ripples.
+      // Throttle slightly to keep it smooth on slower machines.
+      if (now - lastWipeEnqueueTime > 18) {
+        const auraNow = computeAuraState(now);
+        wipeEvents.push({
+          x, y,
+          t0: now,
+          hue: auraNow.hue,
+          sat: auraNow.saturation,
+          bri: auraNow.brightness,
+          speed: auraNow.speedNorm,
+          jitter: auraNow.jitterNorm
+        });
+        if (wipeEvents.length > 42) wipeEvents.shift();
+        lastWipeEnqueueTime = now;
+      }
+    }
+
+    window.addEventListener('mousemove', handleMouseMove);
+
+    // ====== Aura mapping: behavior → color state ======
+
+    function clamp01(v) {
+      return Math.max(0, Math.min(1, v));
+    }
+
+    // HSV/HSB to RGBA
+    function hsbToRgba(h, s, b, a) {
+      const c = b * s;
+      const hp = (h % 360) / 60;
+      const x = c * (1 - Math.abs((hp % 2) - 1));
+      let r = 0, g = 0, bl = 0;
+
+      if (0 <= hp && hp < 1) { r = c; g = x; bl = 0; }
+      else if (1 <= hp && hp < 2) { r = x; g = c; bl = 0; }
+      else if (2 <= hp && hp < 3) { r = 0; g = c; bl = x; }
+      else if (3 <= hp && hp < 4) { r = 0; g = x; bl = c; }
+      else if (4 <= hp && hp < 5) { r = x; g = 0; bl = c; }
+      else if (5 <= hp && hp < 6) { r = c; g = 0; bl = x; }
+
+      const m = b - c;
+      r = Math.round((r + m) * 255);
+      g = Math.round((g + m) * 255);
+      bl = Math.round((bl + m) * 255);
+      return `rgba(${r}, ${g}, ${bl}, ${a})`;
+    }
+
+    function computeAuraState(now) {
+      // Normalize metrics -------------------------------------------------
+      const idleMs = now - lastInteractionTime;
+      const idleSec = idleMs / 1000;
+
+      // Speed normalization: typical hand motion ~ 0–1 px/ms
+      const maxSpeed = 1.0; // px/ms
+      const speedNorm = clamp01(emaSpeed / maxSpeed);
+
+      // Jitter normalization: angle delta 0..PI
+      const maxJitter = Math.PI;
+      const jitterNorm = clamp01(emaJitter / maxJitter);
+
+      // Idle normalization: slower fade so presence doesn't collapse instantly
+      const idleMax = 60;
+      const idleNorm = clamp01(idleSec / idleMax);
+
+      // Click rate normalization: clicks per 10s
+      const windowMs = 10000;
+      while (clickTimestamps.length && now - clickTimestamps[0] > windowMs) {
+        clickTimestamps.shift();
+      }
+      const clicksPer10s = clickTimestamps.length;
+      const clickNorm = clamp01(clicksPer10s / 8); // 0–8 clicks -> 0–1
+
+      // Hue from speed ----------------------------------------------------
+      let hue;
+      if (speedNorm < 0.33) {
+        // Drift → cool blues / teals (200–240)
+        const t = speedNorm / 0.33;
+        hue = 200 + 40 * t;
+      } else if (speedNorm < 0.66) {
+        // Explore → violets (260–300)
+        const t = (speedNorm - 0.33) / 0.33;
+        hue = 260 + 40 * t;
+      } else {
+        // Rush → ambers/oranges (20–50)
+        const t = (speedNorm - 0.66) / 0.34;
+        hue = 20 + 30 * t;
+      }
+
+      // Slight magenta tilt when click-rate is high (performative presence)
+      const magentaInfluence = clickNorm * 0.4; // 0–0.4
+      hue = (1 - magentaInfluence) * hue + magentaInfluence * 315;
+
+      // Saturation from jitter --------------------------------------------
+      const baseSat = 0.25;
+      const maxExtraSat = 0.7;
+      const saturation = clamp01(baseSat + maxExtraSat * jitterNorm);
+
+      // Brightness / alpha from idle --------------------------------------
+      const brightnessActive = 0.9;
+      const brightnessIdle = 0.25;
+      const brightness = brightnessActive * (1 - idleNorm) + brightnessIdle * idleNorm;
+
+      // Aura alpha (how present the color feels)
+      const alphaActive = 0.9;
+      const alphaIdle = 0.3;
+      const auraAlpha = alphaActive * (1 - idleNorm * 0.8) + alphaIdle * idleNorm;
+
+      // Derive fog and trail colors ---------------------------------------
+      // Fog should feel like a dark veil that densifies with absence (idle),
+      // not a white wash that grows while you're present.
+      const fogAlpha = clamp01(0.08 + 0.65 * idleNorm);
+      const trailAlpha = auraAlpha;
+
+      const fogColor = hsbToRgba(hue, saturation * 0.65, 0.25, fogAlpha);
+      const trailColor = hsbToRgba(hue, saturation, Math.min(1, brightness * 1.1), trailAlpha);
+
+      // Classifier label (optional semantic meaning)
+      let label = 'drift';
+      if (idleNorm > 0.7) label = 'fade';
+      else if (speedNorm > 0.7 || clickNorm > 0.4) label = 'rush';
+      else if (speedNorm > 0.35) label = 'explore';
+
+      return {
+        hue,
+        saturation,
+        brightness,
+        auraAlpha,
+        fogColor,
+        trailColor,
+        idleSec,
+        speedNorm,
+        jitterNorm,
+        clickNorm,
+        label
+      };
+    }
+
+    // ====== Fog rendering ======
+    let fogNoiseCanvas = null;
+    let fogNoiseCtx = null;
+    let fogNoiseOffsetX = 0;
+    let fogNoiseOffsetY = 0;
+
+    function initFogNoise() {
+      const size = 160;
+      fogNoiseCanvas = document.createElement('canvas');
+      fogNoiseCanvas.width = size;
+      fogNoiseCanvas.height = size;
+      fogNoiseCtx = fogNoiseCanvas.getContext('2d');
+
+      const imgData = fogNoiseCtx.createImageData(size, size);
+      const data = imgData.data;
+      for (let i = 0; i < data.length; i += 4) {
+        const v = 180 + Math.random() * 60; // soft noise
+        data[i] = v;
+        data[i + 1] = v;
+        data[i + 2] = v;
+        data[i + 3] = 35 + Math.random() * 65; // 35–100 alpha
+      }
+      fogNoiseCtx.putImageData(imgData, 0, 0);
+    }
+
+    function gentlyThickenFog(aura, dt) {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      // Mirror behavior: fog only starts returning after prolonged inactivity.
+      if (aura.idleSec < FOG_REBUILD_START_IDLE_S) return;
+
+      // Rebuild ramps up slowly after the threshold, so wiped areas stay clear.
+      const t = clamp01((aura.idleSec - FOG_REBUILD_START_IDLE_S) / FOG_REBUILD_RAMP_S);
+      const rebuildAlpha = FOG_REBUILD_ALPHA_MIN + (FOG_REBUILD_ALPHA_MAX - FOG_REBUILD_ALPHA_MIN) * (t * t);
+      const alpha = rebuildAlpha * (dt / 16); // scale with frame time
+
+      fogCtx.save();
+      fogCtx.globalCompositeOperation = 'source-over';
+      fogCtx.fillStyle = aura.fogColor.replace(/rgba\(([^,]+),([^,]+),([^,]+),[^)]+\)/,
+        (_, r, g, b) => `rgba(${r},${g},${b},${alpha})`
+      );
+      fogCtx.fillRect(0, 0, w, h);
+      fogCtx.restore();
+    }
+
+    function easeOutCubic(t) {
+      const x = clamp01(t);
+      return 1 - Math.pow(1 - x, 3);
+    }
+
+    function applyWipeBrush(x, y, outer, strength) {
+      const s = clamp01(strength);
+      const inner = outer * 0.12;
+      const mid = outer * 0.55;
+
+      fogCtx.save();
+      fogCtx.globalCompositeOperation = 'destination-out';
+      const g = fogCtx.createRadialGradient(x, y, inner, x, y, outer);
+      g.addColorStop(0.0, `rgba(0,0,0,${0.95 * s})`);
+      g.addColorStop(0.35, `rgba(0,0,0,${0.70 * s})`);
+      g.addColorStop(0.75, `rgba(0,0,0,${0.18 * s})`);
+      g.addColorStop(1.0, 'rgba(0,0,0,0.0)');
+      fogCtx.fillStyle = g;
+      fogCtx.beginPath();
+      fogCtx.arc(x, y, outer, 0, Math.PI * 2);
+      fogCtx.fill();
+      fogCtx.restore();
+    }
+
+    function renderWipeEffects(now) {
+      if (!wipeEvents.length) return;
+
+      const baseOuter = Math.max(profile.radius * 2, 110);
+      const delayMs = 70;     // slight lag: condensation “catches up”
+      const wipeMs = 180;     // brush ramps in (not instant)
+      const rippleMs = 650;   // presence disturbs atmosphere
+
+      for (let i = wipeEvents.length - 1; i >= 0; i--) {
+        const ev = wipeEvents[i];
+        const age = now - ev.t0;
+
+        if (age > rippleMs) {
+          wipeEvents.splice(i, 1);
+          continue;
+        }
+
+        // --- Wipe (delayed, soft edge) ---
+        if (age > delayMs && age < delayMs + wipeMs) {
+          const t = (age - delayMs) / wipeMs;
+          const strength = 0.45 + 0.55 * easeOutCubic(t);
+          const outer = baseOuter * (0.75 + 0.55 * ev.speed);
+          applyWipeBrush(ev.x, ev.y, outer, strength);
+
+          // --- Bloom / neon edge (tasteful) ---
+          const glowA = (0.05 + 0.08 * ev.speed) * (1 - t);
+          const sat = clamp01(ev.sat * (0.85 + 0.35 * ev.jitter));
+          const bri = Math.min(1, 0.55 + 0.55 * ev.bri);
+          const off = 1.6;
+
+          fogCtx.save();
+          fogCtx.globalCompositeOperation = 'screen';
+          fogCtx.globalAlpha = glowA;
+          fogCtx.shadowBlur = 18 + 18 * ev.jitter;
+
+          const colors = [
+            { dx: -off, dy: 0.0, h: (ev.hue - 10 + 360) % 360 },
+            { dx:  0.0, dy: 0.0, h: ev.hue },
+            { dx:  off, dy: 0.0, h: (ev.hue + 10) % 360 }
+          ];
+
+          for (const c of colors) {
+            const rr = outer * 0.95;
+            const gg = fogCtx.createRadialGradient(ev.x + c.dx, ev.y + c.dy, rr * 0.15, ev.x + c.dx, ev.y + c.dy, rr);
+            gg.addColorStop(0.0, hsbToRgba(c.h, sat, bri, 0.32));
+            gg.addColorStop(0.7, hsbToRgba(c.h, sat * 0.7, bri * 0.7, 0.10));
+            gg.addColorStop(1.0, 'rgba(0,0,0,0)');
+            fogCtx.fillStyle = gg;
+            fogCtx.beginPath();
+            fogCtx.arc(ev.x + c.dx, ev.y + c.dy, rr, 0, Math.PI * 2);
+            fogCtx.fill();
+          }
+          fogCtx.restore();
+        }
+
+        // --- Ripple ring (very subtle) ---
+        const rt = age / rippleMs;
+        const r = baseOuter * (0.22 + 0.92 * rt);
+        const ra = 0.06 * (1 - rt) * (0.6 + 0.6 * ev.jitter);
+        if (ra > 0.001) {
+          fogCtx.save();
+          fogCtx.globalCompositeOperation = 'screen';
+          fogCtx.lineWidth = 1.15;
+          fogCtx.strokeStyle = hsbToRgba(ev.hue, clamp01(ev.sat * 0.9), 0.9, ra);
+          fogCtx.shadowColor = hsbToRgba(ev.hue, clamp01(ev.sat), 1.0, ra);
+          fogCtx.shadowBlur = 14;
+          fogCtx.beginPath();
+          fogCtx.arc(ev.x, ev.y, r, 0, Math.PI * 2);
+          fogCtx.stroke();
+          fogCtx.restore();
+        }
+      }
+    }
+
+    function clearFogPulse() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      fogCtx.save();
+      fogCtx.globalCompositeOperation = 'destination-out';
+      fogCtx.fillStyle = `rgba(0,0,0,${FOG_CLEAR_PULSE_ALPHA})`;
+      fogCtx.fillRect(0, 0, w, h);
+      fogCtx.restore();
+    }
+
+    function gentlyClearFogWhenActive(aura, dt) {
+      // While present, fog should gradually dissipate globally so the page can become clear.
+      if (aura.idleSec > 2) return;
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      // Slightly stronger clearing when moving faster (feels like wiping more confidently).
+      const activityBoost = 0.6 + 0.8 * aura.speedNorm;
+      const alpha = (FOG_CLEAR_ACTIVE_ALPHA * activityBoost) * (dt / 16);
+
+      fogCtx.save();
+      fogCtx.globalCompositeOperation = 'destination-out';
+      fogCtx.fillStyle = `rgba(0,0,0,${alpha})`;
+      fogCtx.fillRect(0, 0, w, h);
+      fogCtx.restore();
+    }
+
+    function animateFogNoise(aura, dt) {
+      if (!fogNoiseCanvas) return;
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      // Minimal motion for “alive” aura
+      const speed = 8 + 30 * aura.jitterNorm; // px per second
+      const shift = (speed * dt) / 1000;
+      fogNoiseOffsetX = (fogNoiseOffsetX + shift * 0.7) % fogNoiseCanvas.width;
+      fogNoiseOffsetY = (fogNoiseOffsetY + shift * 0.4) % fogNoiseCanvas.height;
+
+      // Important: keep wiped areas truly clear.
+      // Draw the noise *only where fog already exists* (alpha mask),
+      // otherwise the noise layer would “gray” the whole screen.
+      fogCtx.save();
+      fogCtx.globalCompositeOperation = 'source-atop';
+      fogCtx.globalAlpha = 0.08 + 0.08 * aura.jitterNorm;
+
+      for (let y = -fogNoiseCanvas.height; y < h + fogNoiseCanvas.height; y += fogNoiseCanvas.height) {
+        for (let x = -fogNoiseCanvas.width; x < w + fogNoiseCanvas.width; x += fogNoiseCanvas.width) {
+          fogCtx.drawImage(
+            fogNoiseCanvas,
+            x + fogNoiseOffsetX,
+            y + fogNoiseOffsetY,
+            fogNoiseCanvas.width,
+            fogNoiseCanvas.height
+          );
+        }
+      }
+
+      fogCtx.restore();
+    }
+
+    // ====== Trails & background rendering ======
+    function renderBackground(aura, dt) {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      // Gentle decay only within the profile circle
+      bgCtx.save();
+      bgCtx.beginPath();
+      bgCtx.arc(profile.cx, profile.cy, profile.radius, 0, Math.PI * 2);
+      bgCtx.clip();
+
+      const decayBase = 0.08;
+      const decayExtra = 0.12 * clamp01(aura.idleSec / 10);
+      const decayAlpha = (decayBase + decayExtra) * (dt / 16);
+
+      bgCtx.fillStyle = `rgba(5, 7, 15, ${decayAlpha})`;
+      bgCtx.fillRect(profile.cx - profile.radius - 2, profile.cy - profile.radius - 2,
+        profile.radius * 2 + 4, profile.radius * 2 + 4);
+
+      // Trails along the cursor path
+      if (pendingTrail) {
+        const width = 1.2 + 3.6 * aura.speedNorm;
+        bgCtx.strokeStyle = aura.trailColor;
+        bgCtx.lineWidth = width;
+        bgCtx.lineCap = 'round';
+        bgCtx.lineJoin = 'round';
+        bgCtx.shadowColor = aura.trailColor;
+        bgCtx.shadowBlur = 10 + 14 * aura.jitterNorm;
+        bgCtx.beginPath();
+        bgCtx.moveTo(pendingTrail.x0, pendingTrail.y0);
+        bgCtx.lineTo(pendingTrail.x1, pendingTrail.y1);
+        bgCtx.stroke();
+        bgCtx.shadowBlur = 0;
+        pendingTrail = null;
+      }
+
+      bgCtx.restore();
+
+      // Profile frame & subtle halo
+      bgCtx.save();
+
+      // Halo glow
+      const haloRadius = profile.radius * 1.3;
+      const haloGrad = bgCtx.createRadialGradient(
+        profile.cx, profile.cy, profile.radius * 0.6,
+        profile.cx, profile.cy, haloRadius
+      );
+      const haloColorStrong = hsbToRgba(aura.hue, aura.saturation, aura.brightness, 0.42);
+      const haloColorFaint = hsbToRgba(aura.hue, aura.saturation * 0.4, aura.brightness * 0.4, 0.0);
+      haloGrad.addColorStop(0, haloColorStrong);
+      haloGrad.addColorStop(1, haloColorFaint);
+
+      bgCtx.globalCompositeOperation = 'screen';
+      bgCtx.fillStyle = haloGrad;
+      bgCtx.beginPath();
+      bgCtx.arc(profile.cx, profile.cy, haloRadius, 0, Math.PI * 2);
+      bgCtx.fill();
+
+      // Circular frame
+      bgCtx.globalCompositeOperation = 'lighter';
+      const rimColorOuter = hsbToRgba(aura.hue, aura.saturation * 0.5, Math.min(1, aura.brightness * 1.1), 0.6);
+      const rimColorInner = 'rgba(15, 23, 42, 0.85)';
+
+      bgCtx.lineWidth = 3;
+      bgCtx.strokeStyle = rimColorOuter;
+      bgCtx.beginPath();
+      bgCtx.arc(profile.cx, profile.cy, profile.radius + 1.5, 0, Math.PI * 2);
+      bgCtx.stroke();
+
+      bgCtx.lineWidth = 2;
+      bgCtx.strokeStyle = rimColorInner;
+      bgCtx.beginPath();
+      bgCtx.arc(profile.cx, profile.cy, profile.radius - 3, 0, Math.PI * 2);
+      bgCtx.stroke();
+
+      bgCtx.restore();
+    }
+
+    // ====== Status text ("last seen") ======
+    const statusEl = document.getElementById('statusText');
+
+    function updateStatusText(aura) {
+      const idle = aura.idleSec;
+      let label = 'now';
+      if (idle > 1) {
+        const seconds = Math.floor(idle);
+        label = `${seconds}s ago`;
+      }
+      statusEl.querySelector('span').textContent = `last seen: ${label}`;
+
+      // Fade in after being idle a bit
+      const fadeStart = 3;  // s
+      const fadeEnd = 15;   // s
+      let opacity = 0;
+      if (idle > fadeStart) {
+        const t = clamp01((idle - fadeStart) / (fadeEnd - fadeStart));
+        opacity = 0.1 + 0.7 * t;
+      }
+      statusEl.style.opacity = opacity.toFixed(2);
+    }
+
+    // ====== Animation loop ======
+    let lastFrameTime = performance.now();
+
+    function frame(now) {
+      const dt = Math.max(now - lastFrameTime, 1);
+      lastFrameTime = now;
+
+      const aura = computeAuraState(now);
+
+      // Background trails & profile
+      renderBackground(aura, dt);
+
+      // Fog evolution
+      gentlyClearFogWhenActive(aura, dt);
+      gentlyThickenFog(aura, dt);
+      renderWipeEffects(now);
+      animateFogNoise(aura, dt);
+
+      // Text
+      updateStatusText(aura);
+
+      requestAnimationFrame(frame);
+    }
+
+    // ====== Init ======
+    function init() {
+      resizeCanvas();
+      initFogNoise();
+
+      // Seed light fog initially
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      const seedAura = computeAuraState(performance.now());
+      fogCtx.save();
+      fogCtx.fillStyle = seedAura.fogColor.replace(/rgba\(([^,]+),([^,]+),([^,]+),[^)]+\)/,
+        (_, r, g, b) => `rgba(${r},${g},${b},0.18)`
+      );
+      fogCtx.fillRect(0, 0, w, h);
+      fogCtx.restore();
+
+      requestAnimationFrame(time => {
+        lastFrameTime = time;
+        frame(time);
+      });
+    }
+
+    window.addEventListener('load', init);
+  </script>
+</body>
+</html>
