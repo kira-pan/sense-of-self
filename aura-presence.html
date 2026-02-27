@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Behavioral Residue – Aura Presence</title>
+  <title>Aura Presence</title>
   <style>
     :root {
       color-scheme: dark;
@@ -99,6 +99,48 @@
     .status span {
       opacity: 0.8;
     }
+
+    .click-effect {
+      position: fixed;
+      width: 80px;
+      height: 80px;
+      left: 0;
+      top: 0;
+      transform: translate(-50%, -50%) scale(0.55);
+      opacity: 0.0;
+      background-image: url("click_animation.png");
+      background-size: contain;
+      background-repeat: no-repeat;
+      background-position: center;
+      mix-blend-mode: screen;
+      pointer-events: none;
+      filter: drop-shadow(0 0 10px rgba(255,255,255,0.4));
+      animation: click-bloom 420ms ease-out forwards;
+      z-index: 5;
+    }
+
+    @keyframes click-bloom {
+      0% {
+        opacity: 0.0;
+        transform: translate(-50%, -50%) scale(0.45);
+        filter: drop-shadow(0 0 0px rgba(255,255,255,0.0));
+      }
+      30% {
+        opacity: 0.82;
+        transform: translate(-50%, -50%) scale(0.8);
+        filter: drop-shadow(0 0 14px rgba(255,255,255,0.7));
+      }
+      80% {
+        opacity: 0.45;
+        transform: translate(-50%, -50%) scale(1.05);
+        filter: drop-shadow(0 0 20px rgba(255,255,255,0.35));
+      }
+      100% {
+        opacity: 0.0;
+        transform: translate(-50%, -50%) scale(1.15);
+        filter: drop-shadow(0 0 26px rgba(255,255,255,0.0));
+      }
+    }
   </style>
 </head>
 <body>
@@ -191,11 +233,25 @@
 
     const clickTimestamps = []; // ms
 
-    function registerClick() {
+    function spawnClickAnimation(x, y) {
+      const el = document.createElement('div');
+      el.className = 'click-effect';
+      el.style.left = `${x}px`;
+      el.style.top = `${y}px`;
+      document.body.appendChild(el);
+      el.addEventListener('animationend', () => {
+        el.remove();
+      });
+    }
+
+    function registerClick(e) {
       const now = performance.now();
       clickTimestamps.push(now);
       lastInteractionTime = now;
       clearFogPulse();
+      if (e && typeof e.clientX === 'number' && typeof e.clientY === 'number') {
+        spawnClickAnimation(e.clientX, e.clientY);
+      }
     }
 
     window.addEventListener('click', registerClick);
